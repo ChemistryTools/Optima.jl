@@ -694,13 +694,20 @@ amount of the phase is stable.
 function phase_tangent_measure(
         prob::DualNewtonProblem, k::Int, u::AbstractVector, x::AbstractVector;
         maxit::Int = 50, tol::Float64 = 1.0e-12, total::Float64 = 1.0e-6,
-        g = prob.g, q = prob.q0,
+        g = prob.g, q = prob.q0, start = nothing,
     )
     ph = prob.phases[k]
     nm = length(ph.members)
     nm == 0 && return -Inf
     xt = Vector{Float64}(x)
-    frac = fill(1.0 / nm, nm)
+    # The successive substitution below converges to the stationary point of the
+    # tangent-plane distance NEAREST its start, so which start is used decides
+    # which one is found. A uniform start is the natural probe for a phase held
+    # absent. It is not enough for a phase that is PRESENT: there the phase's own
+    # composition is a stationary point with measure zero, and the uniform start
+    # runs straight to it, reporting nothing however unstable the phase is. Such
+    # a phase needs starts elsewhere — see `phase_split_measure`.
+    frac = start === nothing ? fill(1.0 / nm, nm) : collect(start)
     lnZ = -Inf
     d = Vector{Float64}(undef, nm)
     for _ in 1:maxit
@@ -723,6 +730,58 @@ function phase_tangent_measure(
         Δ < tol && break
     end
     return lnZ
+end
+
+"""
+    phase_split_measure(prob, k, u, x; kwargs...) -> Float64
+
+How far a **present** mixing phase is from wanting to split into two coexisting
+compositions: the largest tangent-plane distance found from any start other than
+the phase's own composition.
+
+A positive value means a composition exists that lies **below** the tangent plane
+at the current one, so the Gibbs minimum for that phase is not one composition
+but two, and an answer reporting a single one is not the minimum however well it
+satisfies the stationarity conditions of its members.
+
+This is the case a **miscibility gap** produces, and it is not hypothetical for a
+cement: the published Redlich-Kister parameters of the AFm sulfate/hydroxide and
+AFt sulfate/carbonate binaries are concave over an interval, so a phase sitting
+in that interval unmixes.
+
+Why it needs its own function rather than a call to
+[`phase_tangent_measure`](@ref) with the default start: at equilibrium the
+members of a present phase satisfy `uᵢ = gᵢ + hᵢ`, so the tangent-plane distance
+at the phase's own composition is exactly zero and is a stationary point of the
+iteration. Started uniformly, the search converges to it and reports zero. The
+starts used here are the **end-member corners**, which lie in the other lobe
+when there is one.
+
+Returns `-Inf` for a phase of fewer than two members, which cannot split.
+"""
+function phase_split_measure(
+        prob::DualNewtonProblem, k::Int, u::AbstractVector, x::AbstractVector;
+        maxit::Int = 50, tol::Float64 = 1.0e-12, total::Float64 = 1.0e-6,
+        g = prob.g, q = prob.q0, corner::Float64 = 0.98,
+    )
+    ph = prob.phases[k]
+    nm = length(ph.members)
+    nm < 2 && return -Inf
+    worst = -Inf
+    for j in 1:nm
+        # Nearly pure in member `j`, the rest shared. Not exactly pure: a corner
+        # of the simplex is itself a fixed point of the substitution.
+        frac = fill((1 - corner) / (nm - 1), nm)
+        frac[j] = corner
+        worst = max(
+            worst,
+            phase_tangent_measure(
+                prob, k, u, x; maxit = maxit, tol = tol, total = total,
+                g = g, q = q, start = frac,
+            ),
+        )
+    end
+    return worst
 end
 
 # ── the solve ─────────────────────────────────────────────────────────────────
@@ -1635,7 +1694,38 @@ function kkt_certificate(
             worst_phase, phase_tangent_measure(prob, k, u, xv; g = gq, q = q),
         )
     end
-    worst_all = max(worst, worst_phase)
+    # A mixing phase that is PRESENT is tested by the stationarity of its members
+    # and by nothing else, and stationarity is blind to the one failure that
+    # matters for a non-ideal phase: that the Gibbs minimum for it is TWO
+    # coexisting compositions rather than the one reported. Convexity is what
+    # made that safe to ignore, and a Redlich-Kister excess term strong enough to
+    # open a miscibility gap is exactly the case where convexity fails.
+    #
+    # Costs nothing on a convex system: at equilibrium the measure below is zero
+    # by construction there, so it cannot move `worst_all`.
+    worst_split = -Inf
+    split_phases = Int[]
+    for (k, ph) in pairs(prob.phases)
+        length(ph.members) < 2 && continue
+        # Mole-fraction phases only. The aqueous solution is a phase here too,
+        # but its activities are molalities referred to the solvent, not mole
+        # fractions of its own members, and the tangent-plane measure is written
+        # in the latter -- applied to it, it measures nothing meaningful. It also
+        # cannot unmix: there is one solvent.
+        ph.mole_fraction || continue
+        ph.always_present && continue
+        any(xv[i] > floor && !(i in dead) for i in ph.members) || continue
+        m = phase_split_measure(prob, k, u, xv; g = gq, q = q)
+        if m > worst_split
+            worst_split = m
+        end
+        # Flagged on the SAME tolerance the verdict uses. At a converged
+        # equilibrium the measure is zero up to rounding, and `m > 0` alone
+        # would name a phase on 1e-12 of numerical noise.
+        m > si_tol && push!(split_phases, k)
+    end
+
+    worst_all = max(worst, worst_phase, worst_split)
 
     return (;
         stationarity = stationarity, stationarity_abs = stat_raw,
@@ -1643,6 +1733,7 @@ function kkt_certificate(
         feasibility_abs = feas_abs,
         worst_violation = worst_all, worst_violation_bounded = worst,
         worst_violation_phase = worst_phase, absent_phases = absent_phases,
+        worst_violation_split = worst_split, split_phases = split_phases,
         n_interior = length(interior),
         n_forced_zero = length(dead),
         param_residual = param_residual,

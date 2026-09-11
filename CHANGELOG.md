@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.5.3 — a phase that is present can still be the wrong answer
+
+The optimality certificate tested a mixing phase held **absent** with Michelsen's
+tangent-plane measure, and tested one that is **present** by the stationarity of
+its members and nothing else. Stationarity is blind to the single failure that
+matters for a non-ideal phase: that the Gibbs minimum for it is *two* coexisting
+compositions rather than the one reported.
+
+Convexity is what made that safe to ignore. A Redlich-Kister excess term strong
+enough to open a **miscibility gap** is exactly where convexity fails, and it is
+not a hypothetical case — the published parameters of the AFm sulfate/hydroxide
+and AFt sulfate/carbonate binaries of CEMDATA18 are concave over an interval.
+
+### Added — `phase_split_measure`
+
+The largest tangent-plane distance reachable from any start **other than the
+phase's own composition**, and it needs its own function rather than a keyword on
+`phase_tangent_measure` for a reason worth recording: at equilibrium the members
+of a present phase satisfy `uᵢ = gᵢ + hᵢ`, so the tangent-plane distance at that
+composition is exactly zero *and is a stationary point of the successive
+substitution*. Started uniformly — which is the right start for an absent phase —
+the search walks straight to it and reports zero however unstable the phase is.
+The starts used here are the end-member corners, which lie in the other lobe when
+there is one.
+
+`kkt_certificate` now folds that measure into `worst_violation` for every present
+mole-fraction phase, and reports `worst_violation_split` and `split_phases`
+alongside the existing fields.
+
+### What it does not touch
+
+Nothing on a convex system: there the measure is zero at equilibrium by
+construction. The full suite is unchanged at 268/268.
+
+One restriction is deliberate and was found by that suite rather than by
+reasoning. The measure applies to **mole-fraction phases only**. The aqueous
+solution is a phase in this formulation too, but its activities are molalities
+referred to the solvent rather than mole fractions of its own members, so the
+measure — which is written in the latter — computes nothing meaningful for it.
+Applied indiscriminately it made two convex reference problems fail to certify.
+It also cannot unmix: there is one solvent.
+
+### Breaking changes
+
+Nothing in the API breaks and no default behavior changes on a convex problem.
+Two consequences are breaking in practice:
+
+- **A non-convex mixing phase that used to certify now may not.** That is the
+  point of the release: such an answer was a KKT point and not a minimum, and the
+  certificate said otherwise. Code relying on the old verdict was relying on a
+  claim the solver could not support.
+- **The registry treats a minor bump below 1.0 as breaking whatever the API
+  did**, so a downstream bound pinned to `"0.5"` accepts this patch release, but
+  `ChemistryLab` must require `OptimaSolver = "0.5.3"` to get the check at all.
+
+
 ## v0.5.2 — a step whose inner solve has not converged is not a descent step
 
 The outer residual of the dual Newton is **not a function of `v` alone**.
