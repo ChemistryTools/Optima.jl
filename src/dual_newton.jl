@@ -404,6 +404,17 @@ Base.@kwdef struct DualNewtonOptions
     maxit::Int = 200
     max_active_updates::Int = 200
     si_tol::Float64 = 1.0e-8
+    # The inner fixed point that recovers the phase compositions, and the
+    # tolerance at which its answer may be trusted.
+    #
+    # `inner_tol` is what makes the outer residual a FUNCTION of `v`. The inner
+    # loop is warm-started from the `W` it is handed, so its answer depends on
+    # that warm start until it has converged; once it has, re-running it from its
+    # own output changes nothing, and the residual depends on `v` alone. Steps
+    # whose inner solve did not reach this are refused rather than accepted on a
+    # residual that the next iteration will not reproduce.
+    inner_tol::Float64 = 1.0e-10
+    inner_maxit::Int = 200
     verbose::Bool = false
 end
 
@@ -470,10 +481,12 @@ end
 function _invert_phases!(
         prob, W, y, refs, act_ph, active, xB, x_buf;
         dead = Set{Int}(), g = prob.g, q = prob.q0,
+        resid::Union{Nothing, Base.RefValue{Float64}} = nothing, maxsweeps::Int = 200,
     )
     u = -(transpose(prob.A) * y)
+    worst = Inf
 
-    for _ in 1:200
+    for _ in 1:maxsweeps
         _fill_x!(x_buf, prob, W, refs, act_ph, active, xB)
         hv = current_h(prob, x_buf, q)
         worst = 0.0
@@ -516,6 +529,12 @@ function _invert_phases!(
         worst <= 1.0e-14 && break
     end
 
+    # What the sweeps ended on, so the caller can tell a converged inversion from
+    # one that merely ran out of sweeps. Left unreported, the two are
+    # indistinguishable and the second silently makes the outer residual depend
+    # on the warm start rather than on `v`.
+    resid === nothing || (resid[] = worst)
+
     return _fill_x!(x_buf, prob, W, refs, act_ph, active, xB)
 end
 
@@ -544,6 +563,8 @@ solve.
 function _outer_residual(
         prob, v, W, act_ph, active, b, x_buf;
         dead = Set{Int}(), degenerate = Int[],
+        resid::Union{Nothing, Base.RefValue{Float64}} = nothing,
+        inner_maxit::Int = 200,
     )
     m = size(prob.A, 1)
     nph = length(act_ph)
@@ -558,6 +579,7 @@ function _outer_residual(
 
     _invert_phases!(
         prob, W, y, refs, act_ph, active, xB, x_buf; dead = dead, g = g, q = q,
+        resid = resid, maxsweeps = inner_maxit,
     )
 
     hv = current_h(prob, x_buf, q)
@@ -1052,8 +1074,12 @@ function _dual_newton_attempt(
         v = vcat([log(r) for r in refs], y, xB, q)
         inner_ok = false
 
+        inner_resid = Ref(Inf)
         for _ in 1:(opts.maxit)
-            R = _outer_residual(prob, v, W, act_ph, active, bv, x_buf; dead, degenerate)
+            R = _outer_residual(
+                prob, v, W, act_ph, active, bv, x_buf;
+                dead, degenerate, resid = inner_resid, inner_maxit = opts.inner_maxit,
+            )
             res = maximum(abs, R)
             if opts.verbose
                 # Split by block: the three carry different units — log-activities
@@ -1129,20 +1155,61 @@ function _dual_newton_attempt(
                 end
             end
 
+            # A step is accepted on two conditions, not one.
+            #
+            # The decrease is the obvious one. The second is that the candidate's
+            # INNER solve converged, and it is what makes the test mean anything:
+            # the inner fixed point is warm-started, so until it has converged its
+            # answer — and hence `R_t` — depends on the warm start it was handed.
+            # Accepting such a step compares a residual the next iteration will
+            # not reproduce, and it does not reproduce it: measured on a CEM I
+            # with eight solid solutions, an accepted "descent" step was followed
+            # by a residual of 4.2e17 where the step itself had reported 60.5, and
+            # the active-set round recorded that 4.2e17 as the state's KKT error.
+            # With the gate below the same problem certifies to 1.1e-14, and stops
+            # depending on the last bit of its own input.
             accepted = false
-            for _ in 1:40
-                v_t = v .+ α .* δ
-                W_t = [copy(w) for w in W_ref]
-                R_t = _outer_residual(prob, v_t, W_t, act_ph, active, bv, x_buf; dead, degenerate)
-                if maximum(abs, R_t) < res
-                    v = v_t
-                    for kk in eachindex(W)
-                        W[kk] .= W_t[kk]
+            cand_resid = Ref(Inf)
+            α0 = α
+            # Two passes, and the order is the whole point.
+            #
+            # The first asks for a step that both decreases the residual and whose
+            # inner solve converged; the second drops the second condition. An
+            # inner solve that has not converged leaves `W` still moving, so the
+            # `R_t` it reports is not the residual the next iteration will measure
+            # at the same `v` — measured on a CEM I with eight solid solutions, an
+            # accepted step reporting 60.5 was followed by 4.2e17. Preferring a
+            # converged candidate removes that, and the problem stops depending on
+            # the last bit of its own input.
+            #
+            # The second pass is not a concession: an inner iteration whose `h`
+            # does not depend on the composition has nothing to solve and can
+            # never report convergence, and on such a problem the first pass would
+            # refuse every step and the solve would stall at its starting point.
+            for strict in (true, false)
+                α = α0
+                for _ in 1:40
+                    v_t = v .+ α .* δ
+                    W_t = [copy(w) for w in W_ref]
+                    R_t = _outer_residual(
+                        prob, v_t, W_t, act_ph, active, bv, x_buf;
+                        dead, degenerate, resid = cand_resid,
+                        inner_maxit = opts.inner_maxit,
+                    )
+                    ok = maximum(abs, R_t) < res &&
+                        (!strict || cand_resid[] <= opts.inner_tol)
+                    if ok
+                        v = v_t
+                        for kk in eachindex(W)
+                            W[kk] .= W_t[kk]
+                        end
+                        inner_resid[] = cand_resid[]
+                        accepted = true
+                        break
                     end
-                    accepted = true
-                    break
+                    α /= 2
                 end
-                α /= 2
+                accepted && break
             end
             accepted || break
 
@@ -1175,7 +1242,10 @@ function _dual_newton_attempt(
         # element balance, and the worst violation among the phases held absent —
         # so descending it descends the distance to a KKT point.
         let res_outer = maximum(
-                abs, _outer_residual(prob, v, W, act_ph, active, bv, x_buf; dead, degenerate),
+                abs, _outer_residual(
+                    prob, v, W, act_ph, active, bv, x_buf;
+                    dead, degenerate, inner_maxit = opts.inner_maxit,
+                ),
             )
             viol = 0.0
             for i in prob.idx_bounded

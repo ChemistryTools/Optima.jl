@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.5.2 — a step whose inner solve has not converged is not a descent step
+
+The outer residual of the dual Newton is **not a function of `v` alone**.
+`_outer_residual` calls `_invert_phases!`, which recovers the composition of each
+mixing phase by a damped fixed point started from the `W` it is handed and
+mutated in place. Until that fixed point has converged its answer depends on the
+warm start, and so does the residual computed from it.
+
+The backtracking line search compared the two anyway: it evaluated a candidate
+from a frozen copy of `W`, accepted on a decrease, and wrote the new `W` back;
+the next iteration then recomputed the residual from that new `W` and could get a
+different number. Measured on a cement with eight solid solutions, a step
+accepted as decreasing from 60.5 was followed by a residual of 4.2e17, and the
+active-set round recorded that 4.2e17 as the state's KKT error.
+
+### Bug fixes
+
+- `_invert_phases!` reports the residual its sweeps ended on, so a converged
+  inversion can be told from one that merely ran out of sweeps.
+- The inner Newton loop accepts a step in **two passes**: first a step that both
+  decreases the residual and whose inner solve converged, then — only if none was
+  found — a step that merely decreases it. The second pass is not a concession:
+  an inner iteration whose `h` does not depend on the composition has nothing to
+  solve and can never report convergence, and refusing every step there would
+  stall the solve at its starting point.
+
+### Added
+
+- `DualNewtonOptions` gains `inner_tol` (default `1e-10`) and `inner_maxit`
+  (default `200`), naming what was a hard-coded threshold and sweep cap.
+
+No exported name or signature changes; 268 of 268 tests pass.
+
 ## v0.5.1 — three defects the SciML entry point was hiding
 
 The documented way into this package is the SciML one: hand an
