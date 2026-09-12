@@ -641,3 +641,68 @@ end
     @test isempty(cert.split_phases)
     @test cert.optimal
 end
+
+@testset "a dead end-member is not evidence that a phase wants to split" begin
+    # THE REGRESSION 0.5.4 FIXES. `phase_split_measure` starts the successive
+    # substitution from each corner of the phase's composition simplex. It did so
+    # for every end-member, including one whose conservation row is DEGENERATE --
+    # no matter of that component exists in the system, so the row's multiplier is
+    # pinned at the sentinel `DEGENERATE_POTENTIAL` rather than solved for.
+    #
+    # `uᵢ` for such a member is then not a chemical potential and `uᵢ - gᵢ` is a
+    # number with no meaning. Read by the measure, it reported a converged,
+    # mass-balanced equilibrium as a phase wanting to move to a composition the
+    # element balance forbids -- and reported the SAME value on every unrelated
+    # system carrying the same declaration, which is what a sentinel does and
+    # chemistry does not.
+    #
+    # Three components, three species: a solvent, and a two-member ideal mixing
+    # phase whose SECOND member is the only carrier of component 3. With `b[3]`
+    # zero, that member can never form.
+    Amat = Float64[1 1 0; 0 0 1; 0 0 1]
+    gvec = [0.0, 0.0, 0.0]
+    h(x, _) = begin
+        N = max(x[2] + x[3], 1.0e-300)
+        [
+            log(max(x[1], 1.0e-300)),
+            log(max(x[2], 1.0e-300) / N),
+            log(max(x[3], 1.0e-300) / N),
+        ]
+    end
+    prob = DualNewtonProblem(
+        Amat, gvec, h;
+        phases = [
+            SolutionPhase([1], 1; always_present = true),
+            SolutionPhase([2, 3], 1; mole_fraction = true),
+        ],
+        idx_bounded = Int[],
+    )
+
+    x = [1.0, 0.05, 0.0]
+    b = Amat * x
+    @test b[3] == 0.0                       # component 3 is absent from the system
+
+    dead = Set([3])                          # what `kkt_certificate` derives
+    u = gvec .+ h([1.0, 0.05, 0.05], prob.q0)
+    # The sentinel is what the solver actually pins such a row's multiplier to,
+    # so it is what the measure would read.
+    u_sentinel = copy(u)
+    u_sentinel[3] = OptimaSolver.DEGENERATE_POTENTIAL
+
+    # Ignoring `dead`, the sentinel drives the measure far positive: this is the
+    # defect, reproduced.
+    @test phase_split_measure(prob, 2, u_sentinel, x) > 10.0
+    # Honoring it, the phase has one live member, so there is no interior to
+    # unmix into and no verdict to give.
+    @test phase_split_measure(prob, 2, u_sentinel, x; dead = dead) == -Inf
+    @test phase_tangent_measure(prob, 2, u_sentinel, x; dead = dead) ==
+        phase_tangent_measure(prob, 2, u_sentinel, x; dead = dead, start = [0.5, 0.5])
+
+    # And end to end: the certificate must not fail a converged, mass-balanced
+    # equilibrium on account of a member the element balance forbids.
+    res = dual_newton_solve(prob, b, copy(x))
+    cert = kkt_certificate(prob, res.x, b)
+    @test cert.feasibility <= 1.0e-8
+    @test isempty(cert.split_phases)
+    @test cert.optimal
+end

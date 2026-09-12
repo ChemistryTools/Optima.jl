@@ -1,9 +1,51 @@
 # Changelog
 
-## v0.5.4 — the gradient configuration was rebuilt on every iteration
+## v0.5.4 — a sentinel potential was being read as a chemical potential
 
-A pure performance release. No API change, no behavior change, no different
-answer — the same solve, 62 times cheaper in the term that dominated it.
+Two things, and the first is a **correctness regression in 0.5.3** that anyone
+on that release should move off.
+
+### Fixed — the split test must not probe a composition the element balance forbids
+
+`phase_split_measure`, added in 0.5.3, starts Michelsen's successive
+substitution from each corner of the phase's composition simplex. It did so for
+**every** end-member, including one whose conservation row is degenerate — no
+matter of that component exists in the system, so the row's multiplier is pinned
+at the sentinel `DEGENERATE_POTENTIAL` rather than solved for.
+
+`uᵢ` for such an end-member is therefore not a chemical potential, and `uᵢ - gᵢ`
+is a number with no meaning. Read by the measure, it reported a converged,
+mass-balanced equilibrium as a phase wanting to move to a composition that
+cannot exist.
+
+Measured on a CEM III/A blastfurnace cement: `CSHQ` declared with its alkali
+end-members `KSiOH` and `NaSiOH`, on a paste whose clinker and slag bring no
+potassium and no sodium. Under 0.5.3 the certificate returned
+
+| | 0.5.1 | 0.5.3 | 0.5.4 |
+|:--|--:|--:|--:|
+| element balance | 3.8e-14 | 3.8e-14 | 3.8e-14 |
+| pH, assemblage | identical | identical | identical |
+| `worst_violation` | negative | **+54.06** | negative |
+| `optimal` | `true` | **`false`** | `true` |
+
+The composition never changed — only the verdict did. And **+54.06 was the same
+number on every unrelated system carrying the same declaration**, which is the
+signature of a sentinel rather than of chemistry.
+
+`phase_tangent_measure` and `phase_split_measure` now take the `dead` set and
+exclude those members from the trial composition and from the log-sum-exp, which
+is the guard `_mole_fraction_exponents` has carried from the start; the two
+call sites in `kkt_certificate` pass it. A phase with fewer than two live members
+has no interior to unmix into and returns `-Inf`.
+
+This does not weaken the test it was added for: a genuine miscibility gap has
+both of its lobes made of end-members the element balance can supply.
+
+### Fixed — the gradient configuration was rebuilt on every iteration
+
+A pure performance change: no API change, no different answer — the same solve,
+62 times cheaper in the term that dominated it.
 
 ### Fixed — `ForwardDiff.GradientConfig` is built once per element type
 

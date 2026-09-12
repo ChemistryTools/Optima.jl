@@ -694,11 +694,27 @@ amount of the phase is stable.
 function phase_tangent_measure(
         prob::DualNewtonProblem, k::Int, u::AbstractVector, x::AbstractVector;
         maxit::Int = 50, tol::Float64 = 1.0e-12, total::Float64 = 1.0e-6,
-        g = prob.g, q = prob.q0, start = nothing,
+        g = prob.g, q = prob.q0, start = nothing, dead = Set{Int}(),
     )
     ph = prob.phases[k]
     nm = length(ph.members)
     nm == 0 && return -Inf
+    # A DEAD member is one whose conservation row is degenerate -- no matter of
+    # that component exists in the system, so the row's multiplier is pinned at
+    # the sentinel `DEGENERATE_POTENTIAL` rather than solved for. `uᵢ` for such a
+    # member is therefore not a chemical potential at all, and `uᵢ - gᵢ` is a
+    # number with no meaning. Feeding it to the measure below reports a phase as
+    # wanting to move to a composition THE ELEMENT BALANCE FORBIDS.
+    #
+    # Measured: the CEM III/A of the documentation declares `CSHQ` with its
+    # alkali end-members `KSiOH` and `NaSiOH`, and its slag and clinker bring no
+    # potassium and no sodium. Without this guard the measure returned +54.06 on
+    # a converged, mass-balanced equilibrium -- the same +54.06 on every other
+    # system with the same declaration, which is the signature of a sentinel
+    # rather than of chemistry. `_mole_fraction_exponents` had this guard from
+    # the start; this function was written without it.
+    live = [j for j in 1:nm if !(ph.members[j] in dead)]
+    length(live) < 1 && return -Inf
     xt = Vector{Float64}(x)
     # The successive substitution below converges to the stationary point of the
     # tangent-plane distance NEAREST its start, so which start is used decides
@@ -707,7 +723,20 @@ function phase_tangent_measure(
     # composition is a stationary point with measure zero, and the uniform start
     # runs straight to it, reporting nothing however unstable the phase is. Such
     # a phase needs starts elsewhere — see `phase_split_measure`.
-    frac = start === nothing ? fill(1.0 / nm, nm) : collect(start)
+    frac = if start === nothing
+        f = zeros(nm)
+        for j in live
+            f[j] = 1.0 / length(live)
+        end
+        f
+    else
+        f = collect(start)
+        for j in 1:nm
+            j in live || (f[j] = 0.0)
+        end
+        sf = sum(f)
+        sf > 0 ? f ./ sf : f
+    end
     lnZ = -Inf
     d = Vector{Float64}(undef, nm)
     for _ in 1:maxit
@@ -716,6 +745,10 @@ function phase_tangent_measure(
         end
         hv = current_h(prob, xt, q)
         for (j, i) in enumerate(ph.members)
+            if !(j in live)
+                d[j] = -Inf
+                continue
+            end
             # `hᵢ` is `ln aᵢ = ln(xᵢ/N) + lnγᵢ`, so `lnγ` is what remains once the
             # ideal part is removed.
             lnγ = xt[i] > 0 ? hv[i] - log(xt[i] / total) : 0.0
@@ -762,22 +795,32 @@ Returns `-Inf` for a phase of fewer than two members, which cannot split.
 function phase_split_measure(
         prob::DualNewtonProblem, k::Int, u::AbstractVector, x::AbstractVector;
         maxit::Int = 50, tol::Float64 = 1.0e-12, total::Float64 = 1.0e-6,
-        g = prob.g, q = prob.q0, corner::Float64 = 0.98,
+        g = prob.g, q = prob.q0, corner::Float64 = 0.98, dead = Set{Int}(),
     )
     ph = prob.phases[k]
     nm = length(ph.members)
     nm < 2 && return -Inf
+    # Only the members the element balance can actually supply. A corner on a
+    # dead member is not a composition the phase can take, so it is not evidence
+    # that the phase wants to split -- and its `uᵢ` is a sentinel besides. With
+    # fewer than two live members there is no interior to unmix into.
+    live = [j for j in 1:nm if !(ph.members[j] in dead)]
+    length(live) < 2 && return -Inf
     worst = -Inf
-    for j in 1:nm
-        # Nearly pure in member `j`, the rest shared. Not exactly pure: a corner
-        # of the simplex is itself a fixed point of the substitution.
-        frac = fill((1 - corner) / (nm - 1), nm)
+    for j in live
+        # Nearly pure in member `j`, the rest shared among the live ones. Not
+        # exactly pure: a corner of the simplex is itself a fixed point of the
+        # substitution.
+        frac = zeros(nm)
+        for l in live
+            frac[l] = (1 - corner) / (length(live) - 1)
+        end
         frac[j] = corner
         worst = max(
             worst,
             phase_tangent_measure(
                 prob, k, u, x; maxit = maxit, tol = tol, total = total,
-                g = g, q = q, start = frac,
+                g = g, q = q, start = frac, dead = dead,
             ),
         )
     end
@@ -1691,7 +1734,8 @@ function kkt_certificate(
         all(i in dead for i in ph.members) && continue   # cannot exist at all
         push!(absent_phases, k)
         worst_phase = max(
-            worst_phase, phase_tangent_measure(prob, k, u, xv; g = gq, q = q),
+            worst_phase,
+            phase_tangent_measure(prob, k, u, xv; g = gq, q = q, dead = dead),
         )
     end
     # A mixing phase that is PRESENT is tested by the stationarity of its members
@@ -1715,7 +1759,7 @@ function kkt_certificate(
         ph.mole_fraction || continue
         ph.always_present && continue
         any(xv[i] > floor && !(i in dead) for i in ph.members) || continue
-        m = phase_split_measure(prob, k, u, xv; g = gq, q = q)
+        m = phase_split_measure(prob, k, u, xv; g = gq, q = q, dead = dead)
         if m > worst_split
             worst_split = m
         end
