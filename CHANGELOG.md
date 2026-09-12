@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.5.4 — the gradient configuration was rebuilt on every iteration
+
+A pure performance release. No API change, no behavior change, no different
+answer — the same solve, 62 times cheaper in the term that dominated it.
+
+### Fixed — `ForwardDiff.GradientConfig` is built once per element type
+
+The interior point's gradient fallback read
+
+```julia
+(grad, u, par) -> ForwardDiff.gradient!(grad, v -> f_obj(v, par), u)
+```
+
+with no configuration passed, so ForwardDiff rebuilt the whole `GradientConfig`
+— the dual seeds and every work buffer — on each call. It is called once per
+iteration.
+
+Measured on the Jacobian of that closure, for a 90-species cement paste:
+
+| | cost | relative to one function call |
+|:--|--:|--:|
+| configuration rebuilt each call | 22.47 ms | 3295 × |
+| configuration built once | 0.36 ms | 53 × |
+
+against an ideal of roughly 24 × for 90 inputs at chunk size 12. This was the
+dominant term of a cold cement solve, which is also why a starting point nearer
+the answer had barely moved it: the cost was never in the starting point.
+
+The configuration is kept **per element type** of `u` rather than cached blindly.
+A solve differentiated with respect to its parameters arrives here with `u`
+seeded as `ForwardDiff.Dual`, and a configuration built for `Float64` cannot
+serve it. One per type reuses inside the iteration and rebuilds only when the
+type changes, so the package stays differentiable end to end.
+
+Test suite: 274/274, unchanged.
+
 ## v0.5.3 — a phase that is present can still be the wrong answer
 
 The optimality certificate tested a mixing phase held **absent** with Michelsen's
