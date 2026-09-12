@@ -564,3 +564,80 @@ end
     @test c.feasibility == c.feasibility_abs
 
 end
+
+@testset "a present phase that would rather split" begin
+    # `phase_tangent_measure` asks whether an ABSENT phase should form.
+    # `phase_split_measure` asks whether a PRESENT one should come apart, and
+    # the two are different questions: at equilibrium the tangent-plane distance
+    # at a present phase's own composition is exactly zero AND is a fixed point
+    # of the substitution, so the uniform start used for an absent phase walks
+    # straight to it and reports nothing.
+    #
+    # A symmetric regular solution gives an exact oracle. With
+    #
+    #     g/RT = x ln x + (1-x) ln(1-x) + A x (1-x)
+    #
+    # the second derivative at x = 1/2 is 4 - 2A, so the phase is stable below
+    # A = 2 and unmixes above it. Nothing here is fitted: the threshold is
+    # analytic.
+    Amat = Float64[1 1 0; 0 0 1]
+    gvec = [0.0, 0.0, 0.0]
+
+    function make_prob(Aex)
+        h(x, _) = begin
+            N = max(x[2] + x[3], 1.0e-300)
+            x2 = max(x[2], 1.0e-300) / N
+            x3 = max(x[3], 1.0e-300) / N
+            [
+                log(max(x[1], 1.0e-300)),
+                log(x2) + Aex * x3^2,
+                log(x3) + Aex * x2^2,
+            ]
+        end
+        return DualNewtonProblem(
+            Amat, gvec, h;
+            phases = [
+                SolutionPhase([1], 1; always_present = true),
+                SolutionPhase([2, 3], 1; mole_fraction = true),
+            ],
+            idx_bounded = Int[],
+        )
+    end
+
+    # An equimolar present phase, and the multipliers that make its members
+    # stationary there -- which is what equilibrium means for them.
+    x_present = [1.0, 0.05, 0.05]
+
+    for (Aex, unmixes) in ((1.0, false), (3.0, true))
+        prob = make_prob(Aex)
+        u = gvec .+ prob.h(x_present, prob.q0)
+        m = phase_split_measure(prob, 2, u, x_present)
+        if unmixes
+            @test m > 1.0e-6          # a composition below the tangent plane exists
+        else
+            @test m <= 1.0e-8         # and below the threshold none does
+        end
+    end
+
+    # A phase of one member cannot split, whatever its model.
+    prob1 = DualNewtonProblem(
+        Float64[1 0; 0 1], [0.0, 0.0],
+        (x, _) -> [log(max(x[1], 1.0e-300)), log(max(x[2], 1.0e-300))];
+        phases = [SolutionPhase([2], 1; mole_fraction = true)],
+        idx_bounded = Int[],
+    )
+    @test phase_split_measure(prob1, 1, [0.0, 0.0], [1.0, 1.0]) == -Inf
+
+    # The certificate carries the new fields, and a convex phase AT EQUILIBRIUM
+    # is not accused of splitting. Solved first, deliberately: `kkt_certificate`
+    # derives its own multipliers, and at a composition that is not a solution
+    # they are not the equilibrium ones, so a positive measure there would be
+    # correct rather than a false alarm -- and would test nothing.
+    prob_ok = make_prob(1.0)
+    b_ok = Amat * x_present
+    res_ok = dual_newton_solve(prob_ok, b_ok, copy(x_present))
+    cert = kkt_certificate(prob_ok, res_ok.x, b_ok)
+    @test haskey(cert, :worst_violation_split)
+    @test isempty(cert.split_phases)
+    @test cert.optimal
+end
